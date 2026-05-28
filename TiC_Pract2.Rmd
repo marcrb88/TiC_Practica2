@@ -1,0 +1,201 @@
+---
+title: "TiC Pract 2"
+author: "Marc Roigé Benaiges"
+date: "2026-05-26"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)
+library(lubridate)
+library(randomForest)
+```
+
+## 3. Neteja de les dades
+
+### 3.1. Tractament de zeros, buits i valors que indiquen pèrdua d’informació
+
+
+```{r}
+
+# Carreguem el dataset.
+df <- read_csv("cido_oposicions.csv")
+
+# Recorrem totes les columnes del dataframe i substituïm cadena buida, espai, "Vegeu les bases" per NA.
+
+df <- df %>%
+  mutate(across(everything(),
+                ~na_if(., "") %>% na_if(" ") %>% na_if("Vegeu les bases")))
+
+# Extraiem només la data inicial dins les columnes de dates i convertim les columnes de dates a format Date.
+
+date_cols <- c(
+  "Inici de presentació de sol·licituds",
+  "Finalització de presentació de sol·licituds"
+)
+
+df <- df %>%
+  mutate(across(
+    all_of(date_cols),
+    ~ dmy(str_extract(.x, "\\d{2}/\\d{2}/\\d{4}"))
+  ))
+
+```
+
+### 3.2. Identificació i gestió del tipus de dada
+
+```{r}
+# Convertim les diverses columnes de text en factors. Això facilita l'anàlisi estadística i visualització i prepara el dataset per a models de machine learning que requereixen factors per generar dummies.
+df <- df %>%
+  mutate(
+    status = as.factor(status),
+    `Sistema de selecció` = as.factor(`Sistema de selecció`),
+    `Tipus de personal` = as.factor(`Tipus de personal`),
+    `Grup de titulació o assimilat` = as.factor(`Grup de titulació o assimilat`)
+  )
+
+```
+
+### 3.3. Identificació i gestió de valors extrems
+
+```{r}
+# Mostrem un resum estadístic de la columna
+summary(df$`Finalització de presentació de sol·licituds`)
+```
+
+### 3.4. Altres mètodes de neteja necessaris
+
+```{r}
+# Convertim el camp Matèries en una llista utilitzant la coma com a separador.
+df <- df %>%
+  mutate(Matèries = str_split(Matèries, ",\\s*"))
+```
+
+```{r}
+# Creem variables derivades, per exemple, detectar si es demana anglès.
+df <- df %>%
+  mutate(
+    requereix_angles = if_else(str_detect(`Altres requisits`, regex("angl", ignore_case = TRUE)), 1, 0)
+  )
+```
+
+```{r}
+# Normalitzem el text: minúscules, eliminació d'accents, eliminació de símbols.
+df <- df %>%
+  mutate(across(where(is.character), ~str_to_lower(.) %>% stringi::stri_trans_general("Latin-ASCII")))
+```
+
+
+```{r}
+# Eliminem duplicats.
+df <- df %>% distinct()
+```
+
+## 4. Anàlisi de dades
+
+### 4.1 Model supervisat i no supervisat 
+
+#### 4.1.1 Model supervisat: classificació amb Random Forest
+
+```{r}
+# Creem la variable binària anglès si el camp altres requisits conté "angl".
+# Creem la variable binària català si el camp altres requisits conté "c1".
+# Creem la variable binària informàtica si el camp Matèries conté "Informàtica".
+# Amb el select ens quedem amb les variables interessants per entrenar el model.
+# Amb el drop_na() eliminem totes les files que continguin algun NA en aquestes columnes. 
+df_model <- df %>%
+  mutate(
+    angles = if_else(str_detect(`Altres requisits`, "angl"), 1, 0),
+    catala = if_else(str_detect(`Altres requisits`, "c1"), 1, 0),
+    informatica = if_else(str_detect(Matèries, "Informàtica"), 1, 0)
+  ) %>%
+  select(`Grup de titulació o assimilat`, `Sistema de selecció`,
+         `Tipus de personal`, angles, catala, informatica) %>%
+  drop_na()
+
+# Convertim a factor la variable objectiu.
+df_model$`Grup de titulació o assimilat` <- as.factor(df_model$`Grup de titulació o assimilat`)
+
+```
+
+Entrenem el model supervisat Random Forest. Grup és la variable objectiu (que volem predir) i "." fa referència a totes les altres variables del dataframe. Per tant, el model intenta predir el grup a partir de totes les altres variables del dataframe. 
+
+```{r}
+# Fem un rename de certes columnes per simplificar els noms de les variables. 
+df_model <- df_model %>%
+  rename(
+    grup = `Grup de titulació o assimilat`,
+    sistema = `Sistema de selecció`,
+    tipus = `Tipus de personal`
+  )
+
+# Entrenem el model Random Forest.
+set.seed(123)
+rf <- randomForest(grup ~ ., data = df_model, ntree = 300)
+print(rf)
+```
+
+#### 4.1.1 Model no supervisat: k-means clustering
+
+L'objectiu del model supervisat és identificar grups naturals d'oferta pública sense utilitzar la variable objectiu. Això ens permet veure si les ofertes es poden agrupar segons característiques comunes, com podrien ser els requisits lingüístics, la presència d'informàtica, el tipus de personal, el sistema de selecció...
+
+```{r}
+df_cluster <- df_model %>%
+  mutate(
+    sistema = as.factor(sistema),
+    tipus = as.factor(tipus)
+  ) %>%
+  select(sistema, tipus, angles, catala, informatica) %>%
+  model.matrix(~ . - 1, data = .) %>%
+  as.data.frame()
+
+
+```
+
+Calculem la regla del colze per obtenir la relació entre el nombre de clústers (eix X) i la suma de distàncies internes dins de cada clúster (eix Y). El punt on la corba deixa de disminuir de manera significativa indica el nombre òptim de clústers. En el nostre cas, aquest punt es troba a k=3.
+```{r}
+set.seed(123)
+wss <- sapply(1:10, function(k){
+  kmeans(df_cluster, centers = k, nstart = 20)$tot.withinss
+})
+
+plot(1:10, wss, type = "b")
+
+```
+```{r}
+# Entrenem el model k-means amb 3 clústers.
+set.seed(123)
+k <- kmeans(df_cluster, centers = 3, nstart = 25)
+df_cluster$cluster <- k$cluster
+```
+
+```{r}
+# Calculem les mitjanes de cada variable dins de cada clúster. 
+taula_clusters <- aggregate(
+  df_cluster[, -ncol(df_cluster)],
+  by = list(cluster = df_cluster$cluster),
+  FUN = mean
+)
+
+print(taula_clusters)
+```
+
+
+```{r}
+df_pca <- df_cluster[, -ncol(df_cluster)] 
+
+df_pca <- df_pca[, sapply(df_pca, function(x) length(unique(x)) > 1)]
+
+pca <- prcomp(df_pca, scale. = TRUE)
+plot(pca$x[,1], pca$x[,2], col = df_cluster$cluster, pch = 19)
+
+```
+```{r}
+taula <- table(df_model$grup, df_model$angles)
+chisq.test(taula)
+
+fisher.test(taula)
+
+```
+
