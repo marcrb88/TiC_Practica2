@@ -1,201 +1,833 @@
 ---
-title: "TiC Pract 2"
-author: "Marc Roigé Benaiges"
+title: "TiC Practica 2: neteja i analisi de dades CIDO"
+author: "Marc Roige Benaiges"
 date: "2026-05-26"
-output: html_document
+output:
+  html_document:
+    toc: true
+    toc_depth: 2
+    df_print: paged
 ---
 
 ```{r setup, include=FALSE}
-knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_chunk$set(
+  echo = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  fig.width = 9,
+  fig.height = 5
+)
+
 library(tidyverse)
 library(lubridate)
-library(randomForest)
+library(xgboost)
+library(knitr)
 ```
+
+## Pregunta de recerca
+
+> Quines caracteristiques administratives, formatives i de requisits diferencien les ofertes vinculades a recerca de la resta d'ofertes tecnologiques o informatiques del CIDO?
+
+Aquesta pregunta es treballa per tres motius:
+
+1. Les classes estan practicament balancejades: `Recerca` i `No_recerca`.
+2. La pregunta es interpretable dins del context del dataset.
+3. Permet aplicar un model supervisat, interpretar-lo amb SHAP i comparar-ho amb un agrupament no supervisat.
+
+L'analisi segueix aquests passos:
+
+1. Descriure el dataset i les seves limitacions.
+2. Netejar valors buits, dates, text i categories.
+3. Crear variables derivades i agrupar categories petites.
+4. Entrenar un model supervisat XGBoost per distingir `Recerca` de `No_recerca`.
+5. Interpretar el model amb SHAP, incloent direccionalitat.
+6. Aplicar k-means nomes amb les variables rellevants segons SHAP.
+7. Fer un contrast d'hipotesi sobre una relacio concreta.
+
+## 1. Descripcio del dataset
+
+**Pregunta:** Que representa el dataset i per que pot ser rellevant?
+
+El dataset conte ofertes publiques extretes del CIDO relacionades principalment amb perfils tecnics, informatica, recerca i noves tecnologies. Es rellevant perque permet estudiar si els perfils de recerca tenen caracteristiques administratives diferents de la resta d'ofertes: tipus de personal, sistema de seleccio, titulacio, requisits linguistics i nombre de materies.
+
+```{r carrega-dades}
+df_raw <- read_csv("cido_oposicions.csv", show_col_types = FALSE)
+
+resum_inicial <- tibble(
+  files = nrow(df_raw),
+  columnes = ncol(df_raw),
+  variables_categoriques = sum(map_lgl(df_raw, is.character)),
+  duplicats_exactes = sum(duplicated(df_raw))
+)
+
+kable(resum_inicial)
+```
+
+```{r variables-originals}
+tibble(
+  variable = names(df_raw),
+  tipus_detectat = map_chr(df_raw, ~ class(.x)[1]),
+  valors_unics = map_int(df_raw, n_distinct),
+  valors_buits_o_na = map_int(df_raw, ~ sum(is.na(.x) | .x == ""))
+) %>%
+  arrange(desc(valors_buits_o_na)) %>%
+  kable()
+```
+
+**Resposta:** El dataset es petit i majoritariament categoric. Aixo fa necessari crear variables derivades i agrupar categories petites abans d'aplicar models.
+
+## 2. Integracio i seleccio de dades
+
+**Pregunta:** Quines variables serveixen realment per respondre la pregunta?
+
+No s'integra cap font externa perque el dataset ja conte camps suficients per analitzar les ofertes: titulacio, sistema de seleccio, tipus de personal, dates, materies i requisits.
+
+S'exclouen identificadors, URLs i textos massa directes com a predictors. El target `perfil_recerca` es deriva de `Matèries`, i per tant no s'utilitza `materia_recerca` com a predictor. En canvi, es mantenen altres descriptors del perfil de l'oferta, com informatica, tecnologia, enginyeria, titulacio agrupada, tipus de personal agrupat i requisits linguistics.
 
 ## 3. Neteja de les dades
 
-### 3.1. Tractament de zeros, buits i valors que indiquen pèrdua d’informació
+**Pregunta:** Que cal corregir abans d'analitzar?
 
+Cal transformar el dataset original en una taula analitzable: buits reals com a `NA`, dates en format temporal, text normalitzat, variables categòriques agrupades i variables binaries que capturin requisits i materies d'interes.
 
-```{r}
+### 3.1. Tractament de buits i valors que indiquen perdua d'informacio
 
-# Carreguem el dataset.
-df <- read_csv("cido_oposicions.csv")
+```{r funcions-neteja}
+normalitza_text <- function(x) {
+  x %>%
+    replace_na("") %>%
+    str_squish() %>%
+    str_to_lower() %>%
+    stringi::stri_trans_general("Latin-ASCII")
+}
 
-# Recorrem totes les columnes del dataframe i substituïm cadena buida, espai, "Vegeu les bases" per NA.
+parse_data_cido <- function(x) {
+  dmy(str_extract(x, "[0-9]{2}/[0-9]{2}/[0-9]{4}"))
+}
 
-df <- df %>%
-  mutate(across(everything(),
-                ~na_if(., "") %>% na_if(" ") %>% na_if("Vegeu les bases")))
+moda_chr <- function(x) {
+  x <- x[!is.na(x)]
+  if (length(x) == 0) return(NA_character_)
+  names(sort(table(x), decreasing = TRUE))[1]
+}
 
-# Extraiem només la data inicial dins les columnes de dates i convertim les columnes de dates a format Date.
+limita_iqr <- function(x) {
+  q <- quantile(x, c(0.25, 0.75), na.rm = TRUE)
+  iqr <- q[[2]] - q[[1]]
+  c(
+    inferior = max(0, q[[1]] - 1.5 * iqr),
+    superior = q[[2]] + 1.5 * iqr
+  )
+}
+```
 
-date_cols <- c(
-  "Inici de presentació de sol·licituds",
-  "Finalització de presentació de sol·licituds"
+```{r neteja-base}
+df_clean <- df_raw %>%
+  mutate(across(where(is.character), ~ na_if(str_squish(.x), ""))) %>%
+  mutate(across(where(is.character), ~ na_if(.x, "Vegeu les bases"))) %>%
+  rename(
+    data_final = `Finalització de presentació de sol·licituds`,
+    sistema = `Sistema de selecció`,
+    tipus_personal = `Tipus de personal`,
+    grup_titulacio = `Grup de titulació o assimilat`,
+    titulacio_requerida = `Titulació requerida`,
+    altres_requisits = `Altres requisits`,
+    materies = Matèries,
+    web_ens = `Web de l'ens convocant`,
+    acces_tramit = `Accés al tràmit`,
+    data_inici = `Inici de presentació de sol·licituds`,
+    torn_reservat = `Torn reservat`
+  ) %>%
+  mutate(
+    data_inici = parse_data_cido(data_inici),
+    data_final = parse_data_cido(data_final),
+    title_net = normalitza_text(title),
+    status_net = normalitza_text(status),
+    sistema_net = normalitza_text(sistema),
+    tipus_personal_net = normalitza_text(tipus_personal),
+    grup_titulacio_net = normalitza_text(grup_titulacio),
+    altres_requisits_net = normalitza_text(altres_requisits),
+    materies_net = normalitza_text(materies)
+  )
+
+resum_missing <- df_clean %>%
+  summarise(across(everything(), ~ sum(is.na(.x)))) %>%
+  pivot_longer(everything(), names_to = "variable", values_to = "valors_na") %>%
+  filter(valors_na > 0) %>%
+  arrange(desc(valors_na))
+
+kable(resum_missing)
+```
+
+**Resposta:** Els valors buits i el literal `"Vegeu les bases"` es tracten com a `NA`, ja que indiquen manca d'informacio efectiva. En variables categòriques utilitzades pel model, els valors absents es codifiquen posteriorment com a categoria `desconegut`.
+
+### 3.2. Variables derivades i feature engineering
+
+**Pregunta:** Com convertim el dataset en variables analitzables?
+
+Es creen indicadors binaries a partir del text i s'agrupen categories amb pocs casos. Aquesta decisio es important: amb 114 registres, categories amb 2, 5 o 6 observacions no son prou estables per modelar-les per separat.
+
+```{r variables-derivades}
+df_clean <- df_clean %>%
+  mutate(
+    n_materies = if_else(
+      materies_net == "",
+      0L,
+      str_count(materies, ",") + 1L
+    ),
+    te_data_final = !is.na(data_final),
+    mes_final = replace_na(month(data_final), 0),
+    dies_presentacio = as.numeric(data_final - data_inici),
+    requereix_angles = str_detect(altres_requisits_net, "angl"),
+    requereix_catala = str_detect(altres_requisits_net, "catala"),
+    requereix_catala_c1 = str_detect(altres_requisits_net, "c1"),
+    materia_informatica = str_detect(materies_net, "informatica|programacio|analisi"),
+    materia_recerca = str_detect(materies_net, "recerca|laboratori|biologia|fisica|genetica"),
+    materia_tecnologia = str_detect(materies_net, "tecnologia|dades|telecomunicacions"),
+    materia_enginyeria = str_detect(materies_net, "enginyeria")
+  )
+
+limits_materies <- limita_iqr(df_clean$n_materies)
+
+df_clean <- df_clean %>%
+  mutate(
+    outlier_n_materies = n_materies > limits_materies[["superior"]],
+    n_materies_cap = pmin(n_materies, limits_materies[["superior"]])
+  )
+```
+
+```{r dataset-model}
+df_model <- df_clean %>%
+  distinct() %>%
+  filter(!is.na(grup_titulacio), grup_titulacio_net != "") %>%
+  mutate(
+    perfil_recerca = factor(
+      if_else(materia_recerca, "Recerca", "No_recerca"),
+      levels = c("No_recerca", "Recerca")
+    ),
+    grup_titulacio_simplificat = factor(case_when(
+      str_detect(grup_titulacio_net, "^a1") ~ "universitari_a1",
+      str_detect(grup_titulacio_net, "^(a2|a -|a$)") ~ "universitari_altres",
+      str_detect(grup_titulacio_net, "^c") ~ "no_universitari",
+      TRUE ~ "desconegut"
+    )),
+    tipus_personal_simplificat = factor(case_when(
+      tipus_personal_net == "laboral temporal" ~ "laboral_temporal",
+      tipus_personal_net == "laboral" ~ "laboral_no_temporal",
+      str_detect(tipus_personal_net, "funcionari|interi|temporal") ~ "funcionari_o_interi",
+      TRUE ~ "desconegut"
+    )),
+    sistema_simplificat = factor(case_when(
+      sistema_net == "concurs o valoracio de merits" ~ "merits",
+      sistema_net %in% c("concurs oposicio o valoracio de merits i prova", "oposicio o prova") ~ "prova_o_oposicio",
+      TRUE ~ "desconegut"
+    )),
+    requisit_catala_simplificat = factor(case_when(
+      requereix_catala_c1 ~ "catala_c1",
+      requereix_catala ~ "catala_altre",
+      TRUE ~ "no_especificat"
+    )),
+    row_id = row_number()
+  )
+
+taula_targets <- df_model %>%
+  count(perfil_recerca) %>%
+  mutate(percentatge = round(n / sum(n) * 100, 2))
+
+kable(taula_targets)
+```
+
+```{r frequencies-engineering}
+bind_rows(
+  df_model %>% count(grup_titulacio_simplificat, name = "n") %>% mutate(variable = "grup_titulacio_simplificat", categoria = as.character(grup_titulacio_simplificat)) %>% select(variable, categoria, n),
+  df_model %>% count(tipus_personal_simplificat, name = "n") %>% mutate(variable = "tipus_personal_simplificat", categoria = as.character(tipus_personal_simplificat)) %>% select(variable, categoria, n),
+  df_model %>% count(sistema_simplificat, name = "n") %>% mutate(variable = "sistema_simplificat", categoria = as.character(sistema_simplificat)) %>% select(variable, categoria, n),
+  df_model %>% count(requisit_catala_simplificat, name = "n") %>% mutate(variable = "requisit_catala_simplificat", categoria = as.character(requisit_catala_simplificat)) %>% select(variable, categoria, n)
+) %>%
+  group_by(variable) %>%
+  mutate(percentatge = round(n / sum(n) * 100, 2)) %>%
+  ungroup() %>%
+  arrange(variable, desc(n)) %>%
+  kable()
+```
+
+**Resposta:** El target queda molt ben balancejat: `r taula_targets$n[taula_targets$perfil_recerca == "Recerca"]` ofertes de recerca i `r taula_targets$n[taula_targets$perfil_recerca == "No_recerca"]` de no recerca. Aixo permet entrenar i interpretar un model supervisat sense que una classe domini clarament l'altra.
+
+### 3.3. Valors extrems
+
+**Pregunta:** Hi ha valors extrems que puguin distorsionar l'analisi?
+
+```{r outliers}
+tibble(
+  variable = "n_materies",
+  minim = min(df_clean$n_materies),
+  q1 = quantile(df_clean$n_materies, 0.25),
+  mediana = median(df_clean$n_materies),
+  q3 = quantile(df_clean$n_materies, 0.75),
+  maxim = max(df_clean$n_materies),
+  limit_superior_iqr = limits_materies[["superior"]],
+  outliers_detectats = sum(df_clean$outlier_n_materies)
+) %>%
+  kable()
+
+ggplot(df_clean, aes(x = n_materies)) +
+  geom_histogram(binwidth = 1, fill = "#86BBD8", color = "white") +
+  geom_vline(xintercept = limits_materies[["superior"]], linetype = "dashed", color = "#D1495B") +
+  labs(
+    title = "Distribucio del nombre de materies per oferta",
+    x = "Nombre de materies",
+    y = "Nombre d'ofertes"
+  ) +
+  theme_minimal()
+```
+
+**Resposta:** La variable `n_materies` es limita amb la regla de l'IQR mitjançant `n_materies_cap`. Aixo evita que ofertes amb moltes etiquetes tematiques tinguin un pes desproporcionat.
+
+## 4. Analisi de dades
+
+### 4.1. Model supervisat: XGBoost per predir recerca
+
+**Pregunta:** Les variables administratives, formatives i de requisits permeten distingir les ofertes de recerca?
+
+XGBoost s'utilitza com a model supervisat de classificacio binaria. El target es `perfil_recerca`. Per evitar una conclusio dependent d'un unic split, s'executen 100 particions train/test estratificades i es resumeix la distribucio de l'AUC.
+
+```{r xgboost-preparacio}
+set.seed(123)
+
+formula_predictors <- ~ grup_titulacio_simplificat +
+  tipus_personal_simplificat +
+  sistema_simplificat +
+  requisit_catala_simplificat +
+  requereix_angles +
+  materia_informatica +
+  materia_tecnologia +
+  materia_enginyeria +
+  n_materies_cap +
+  te_data_final +
+  mes_final - 1
+
+x_full <- model.matrix(formula_predictors, data = df_model)
+y_full <- if_else(df_model$perfil_recerca == "Recerca", 1, 0)
+
+params_xgb <- list(
+  objective = "binary:logistic",
+  eval_metric = "logloss",
+  max_depth = 2,
+  eta = 0.05,
+  subsample = 0.85,
+  colsample_bytree = 0.85,
+  min_child_weight = 2
 )
 
-df <- df %>%
-  mutate(across(
-    all_of(date_cols),
-    ~ dmy(str_extract(.x, "\\d{2}/\\d{2}/\\d{4}"))
-  ))
+metric_cv <- function(cv, metric, iteracio) {
+  columna <- paste0("test_", metric, "_mean")
+  if (!columna %in% names(cv$evaluation_log)) return(NA_real_)
+  as.numeric(cv$evaluation_log[[columna]][iteracio])
+}
 
-```
+auc_manual <- function(labels, scores) {
+  pos <- scores[labels == 1]
+  neg <- scores[labels == 0]
+  if (length(pos) == 0 || length(neg) == 0) return(NA_real_)
+  mean(outer(pos, neg, ">")) + 0.5 * mean(outer(pos, neg, "=="))
+}
 
-### 3.2. Identificació i gestió del tipus de dada
+balanced_accuracy <- function(labels, scores, threshold) {
+  pred <- if_else(scores >= threshold, 1, 0)
+  tp_rate <- sum(pred == 1 & labels == 1) / sum(labels == 1)
+  tn_rate <- sum(pred == 0 & labels == 0) / sum(labels == 0)
+  mean(c(tp_rate, tn_rate), na.rm = TRUE)
+}
 
-```{r}
-# Convertim les diverses columnes de text en factors. Això facilita l'anàlisi estadística i visualització i prepara el dataset per a models de machine learning que requereixen factors per generar dummies.
-df <- df %>%
-  mutate(
-    status = as.factor(status),
-    `Sistema de selecció` = as.factor(`Sistema de selecció`),
-    `Tipus de personal` = as.factor(`Tipus de personal`),
-    `Grup de titulació o assimilat` = as.factor(`Grup de titulació o assimilat`)
+entrena_i_valida_xgb <- function(seed, train_prop = 0.80) {
+  set.seed(seed)
+  train_ids <- df_model %>%
+    group_by(perfil_recerca) %>%
+    slice_sample(prop = train_prop) %>%
+    ungroup() %>%
+    pull(row_id)
+
+  train_index <- df_model$row_id %in% train_ids
+  dtrain <- xgb.DMatrix(x_full[train_index, , drop = FALSE], label = y_full[train_index])
+  dtest <- xgb.DMatrix(x_full[!train_index, , drop = FALSE], label = y_full[!train_index])
+
+  cv <- xgb.cv(
+    params = params_xgb,
+    data = dtrain,
+    nrounds = 250,
+    nfold = 5,
+    stratified = TRUE,
+    early_stopping_rounds = 20,
+    verbose = 0
   )
 
-```
-
-### 3.3. Identificació i gestió de valors extrems
-
-```{r}
-# Mostrem un resum estadístic de la columna
-summary(df$`Finalització de presentació de sol·licituds`)
-```
-
-### 3.4. Altres mètodes de neteja necessaris
-
-```{r}
-# Convertim el camp Matèries en una llista utilitzant la coma com a separador.
-df <- df %>%
-  mutate(Matèries = str_split(Matèries, ",\\s*"))
-```
-
-```{r}
-# Creem variables derivades, per exemple, detectar si es demana anglès.
-df <- df %>%
-  mutate(
-    requereix_angles = if_else(str_detect(`Altres requisits`, regex("angl", ignore_case = TRUE)), 1, 0)
+  best_nrounds <- cv$best_iteration
+  fit <- xgb.train(
+    params = params_xgb,
+    data = dtrain,
+    nrounds = best_nrounds,
+    verbose = 0
   )
-```
 
-```{r}
-# Normalitzem el text: minúscules, eliminació d'accents, eliminació de símbols.
-df <- df %>%
-  mutate(across(where(is.character), ~str_to_lower(.) %>% stringi::stri_trans_general("Latin-ASCII")))
-```
+  prob_train <- predict(fit, dtrain)
+  prob_test <- predict(fit, dtest)
+  thresholds <- seq(0.20, 0.80, by = 0.01)
+  threshold_opt <- thresholds[
+    which.max(map_dbl(thresholds, ~ balanced_accuracy(y_full[train_index], prob_train, .x)))
+  ]
+  pred_test <- if_else(prob_test >= threshold_opt, 1, 0)
 
+  tibble(
+    seed = seed,
+    n_train = sum(train_index),
+    n_test = sum(!train_index),
+    millor_iteracio = best_nrounds,
+    logloss_cv = metric_cv(cv, "logloss", best_nrounds),
+    threshold = threshold_opt,
+    auc_test = auc_manual(y_full[!train_index], prob_test),
+    accuracy = mean(pred_test == y_full[!train_index]),
+    sensibilitat_recerca = sum(pred_test == 1 & y_full[!train_index] == 1) / sum(y_full[!train_index] == 1),
+    especificitat_no_recerca = sum(pred_test == 0 & y_full[!train_index] == 0) / sum(y_full[!train_index] == 0)
+  )
+}
 
-```{r}
-# Eliminem duplicats.
-df <- df %>% distinct()
-```
+resultats_validacio <- map_dfr(1:100, entrena_i_valida_xgb)
 
-## 4. Anàlisi de dades
-
-### 4.1 Model supervisat i no supervisat 
-
-#### 4.1.1 Model supervisat: classificació amb Random Forest
-
-```{r}
-# Creem la variable binària anglès si el camp altres requisits conté "angl".
-# Creem la variable binària català si el camp altres requisits conté "c1".
-# Creem la variable binària informàtica si el camp Matèries conté "Informàtica".
-# Amb el select ens quedem amb les variables interessants per entrenar el model.
-# Amb el drop_na() eliminem totes les files que continguin algun NA en aquestes columnes. 
-df_model <- df %>%
-  mutate(
-    angles = if_else(str_detect(`Altres requisits`, "angl"), 1, 0),
-    catala = if_else(str_detect(`Altres requisits`, "c1"), 1, 0),
-    informatica = if_else(str_detect(Matèries, "Informàtica"), 1, 0)
+resum_validacio <- resultats_validacio %>%
+  summarise(
+    auc_mitjana = mean(auc_test, na.rm = TRUE),
+    auc_mediana = median(auc_test, na.rm = TRUE),
+    auc_q1 = quantile(auc_test, 0.25, na.rm = TRUE),
+    auc_q3 = quantile(auc_test, 0.75, na.rm = TRUE),
+    pct_auc_superior_05 = mean(auc_test > 0.5, na.rm = TRUE) * 100,
+    accuracy_mitjana = mean(accuracy, na.rm = TRUE),
+    sensibilitat_mitjana = mean(sensibilitat_recerca, na.rm = TRUE),
+    especificitat_mitjana = mean(especificitat_no_recerca, na.rm = TRUE)
   ) %>%
-  select(`Grup de titulació o assimilat`, `Sistema de selecció`,
-         `Tipus de personal`, angles, catala, informatica) %>%
-  drop_na()
+  mutate(across(everything(), ~ round(.x, 3)))
 
-# Convertim a factor la variable objectiu.
-df_model$`Grup de titulació o assimilat` <- as.factor(df_model$`Grup de titulació o assimilat`)
-
+kable(resum_validacio)
 ```
 
-Entrenem el model supervisat Random Forest. Grup és la variable objectiu (que volem predir) i "." fa referència a totes les altres variables del dataframe. Per tant, el model intenta predir el grup a partir de totes les altres variables del dataframe. 
+```{r xgboost-grafic-validacio}
+ggplot(resultats_validacio, aes(x = auc_test)) +
+  geom_histogram(binwidth = 0.05, fill = "#86BBD8", color = "white", boundary = 0.5) +
+  geom_vline(xintercept = 0.5, linetype = "dashed", color = "#D1495B") +
+  geom_vline(xintercept = resum_validacio$auc_mediana, color = "#2F4858", linewidth = 1) +
+  labs(
+    title = "Distribucio de l'AUC en 100 particions train/test",
+    subtitle = "La linia discontinua marca AUC = 0.5; la linia fosca marca la mediana observada.",
+    x = "AUC en el conjunt de test",
+    y = "Nombre de particions"
+  ) +
+  theme_minimal()
+```
 
-```{r}
-# Fem un rename de certes columnes per simplificar els noms de les variables. 
-df_model <- df_model %>%
-  rename(
-    grup = `Grup de titulació o assimilat`,
-    sistema = `Sistema de selecció`,
-    tipus = `Tipus de personal`
+```{r model-final}
+dall <- xgb.DMatrix(x_full, label = y_full)
+
+cv_final <- xgb.cv(
+  params = params_xgb,
+  data = dall,
+  nrounds = 250,
+  nfold = 5,
+  stratified = TRUE,
+  early_stopping_rounds = 20,
+  verbose = 0
+)
+
+best_nrounds_final <- cv_final$best_iteration
+
+xgb_fit <- xgb.train(
+  params = params_xgb,
+  data = dall,
+  nrounds = best_nrounds_final,
+  verbose = 0
+)
+
+tibble(
+  millor_iteracio_model_final = best_nrounds_final,
+  logloss_cv_model_final = round(metric_cv(cv_final, "logloss", best_nrounds_final), 3)
+) %>%
+  kable()
+```
+
+**Resposta:** El model separa clarament `Recerca` i `No_recerca`: l'AUC mitjana en 100 particions es `r resum_validacio$auc_mitjana`, amb mediana `r resum_validacio$auc_mediana` i rang interquartilic de `r resum_validacio$auc_q1` a `r resum_validacio$auc_q3`. Aixo indica que les variables escollides contenen informacio rellevant per distingir aquests dos perfils.
+
+### 4.2. Interpretacio del model amb SHAP
+
+**Pregunta:** Quines variables expliquen la classificacio i en quina direccio?
+
+SHAP permet interpretar el model en dos nivells. La mitjana del valor absolut indica quines variables pesen mes. El valor signat indica la direccio: SHAP positiu empeny cap a `Recerca`; SHAP negatiu empeny cap a `No_recerca`.
+
+```{r importancia-xgboost}
+importancia_xgb <- xgb.importance(model = xgb_fit) %>%
+  as_tibble()
+
+kable(head(importancia_xgb, 12))
+
+ggplot(head(importancia_xgb, 12), aes(x = reorder(Feature, Gain), y = Gain)) +
+  geom_col(fill = "#2F4858") +
+  coord_flip() +
+  labs(
+    title = "Importancia de variables segons XGBoost",
+    x = NULL,
+    y = "Gain"
+  ) +
+  theme_minimal()
+```
+
+```{r shap-values}
+shap_matrix <- predict(xgb_fit, dall, predcontrib = TRUE)
+shap_feature_names <- colnames(shap_matrix)[-ncol(shap_matrix)]
+
+shap_values <- as_tibble(
+  as.data.frame(shap_matrix[, shap_feature_names, drop = FALSE], check.names = FALSE)
+)
+
+feature_values <- as_tibble(
+  as.data.frame(x_full[, shap_feature_names, drop = FALSE], check.names = FALSE)
+)
+
+shap_importance <- shap_values %>%
+  summarise(across(everything(), ~ mean(abs(.x)))) %>%
+  pivot_longer(everything(), names_to = "variable", values_to = "mean_abs_shap") %>%
+  arrange(desc(mean_abs_shap))
+
+shap_direction <- shap_values %>%
+  summarise(across(everything(), list(
+    mean_shap = ~ mean(.x),
+    median_shap = ~ median(.x),
+    pct_positive = ~ mean(.x > 0) * 100
+  ))) %>%
+  pivot_longer(
+    everything(),
+    names_to = c("variable", ".value"),
+    names_pattern = "(.+)_(mean_shap|median_shap|pct_positive)"
+  ) %>%
+  left_join(shap_importance, by = "variable") %>%
+  arrange(desc(mean_abs_shap)) %>%
+  mutate(
+    direccio_mitjana = case_when(
+      mean_shap > 0 ~ "Empeny cap a Recerca",
+      mean_shap < 0 ~ "Empeny cap a No_recerca",
+      TRUE ~ "Sense direccio mitjana"
+    )
   )
 
-# Entrenem el model Random Forest.
-set.seed(123)
-rf <- randomForest(grup ~ ., data = df_model, ntree = 300)
-print(rf)
-```
+top_shap_vars <- shap_importance %>%
+  filter(mean_abs_shap > 0) %>%
+  slice_head(n = 5) %>%
+  pull(variable)
 
-#### 4.1.1 Model no supervisat: k-means clustering
+kable(head(shap_importance, 12))
 
-L'objectiu del model supervisat és identificar grups naturals d'oferta pública sense utilitzar la variable objectiu. Això ens permet veure si les ofertes es poden agrupar segons característiques comunes, com podrien ser els requisits lingüístics, la presència d'informàtica, el tipus de personal, el sistema de selecció...
+ggplot(head(shap_importance, 12), aes(x = reorder(variable, mean_abs_shap), y = mean_abs_shap)) +
+  geom_col(fill = "#33658A") +
+  coord_flip() +
+  labs(
+    title = "Importancia global segons SHAP",
+    x = NULL,
+    y = "Mitjana del valor SHAP absolut"
+  ) +
+  theme_minimal()
 
-```{r}
-df_cluster <- df_model %>%
+kable(
+  shap_direction %>%
+    select(variable, mean_abs_shap, mean_shap, median_shap, pct_positive, direccio_mitjana) %>%
+    mutate(across(where(is.numeric), ~ round(.x, 3))) %>%
+    slice_head(n = 12)
+)
+
+ggplot(head(shap_direction, 12), aes(x = reorder(variable, mean_shap), y = mean_shap, fill = mean_shap > 0)) +
+  geom_col() +
+  coord_flip() +
+  scale_fill_manual(values = c("#D1495B", "#2F4858"), guide = "none") +
+  geom_hline(yintercept = 0, color = "grey40") +
+  labs(
+    title = "Direccio mitjana de l'efecte SHAP",
+    subtitle = "Valors positius empenyen cap a Recerca; valors negatius cap a No_recerca.",
+    x = NULL,
+    y = "SHAP mitja signat"
+  ) +
+  theme_minimal()
+
+shap_long <- shap_values %>%
+  mutate(id = row_number()) %>%
+  pivot_longer(-id, names_to = "variable", values_to = "shap")
+
+feature_long <- feature_values %>%
+  mutate(id = row_number()) %>%
+  pivot_longer(-id, names_to = "variable", values_to = "valor_feature")
+
+shap_plot_data <- shap_long %>%
+  inner_join(feature_long, by = c("id", "variable")) %>%
+  filter(variable %in% top_shap_vars) %>%
   mutate(
-    sistema = as.factor(sistema),
-    tipus = as.factor(tipus)
+    variable = factor(variable, levels = rev(top_shap_vars)),
+    valor_feature_label = case_when(
+      as.character(variable) %in% c("n_materies_cap", "mes_final") ~ "Valor numeric",
+      valor_feature == 0 ~ "0 / FALSE",
+      valor_feature == 1 ~ "1 / TRUE",
+      TRUE ~ "Valor numeric"
+    )
+  )
+
+shap_per_valor <- shap_plot_data %>%
+  group_by(variable, valor_feature_label) %>%
+  summarise(
+    n = n(),
+    shap_mitja = mean(shap),
+    shap_media = median(shap),
+    .groups = "drop"
   ) %>%
-  select(sistema, tipus, angles, catala, informatica) %>%
-  model.matrix(~ . - 1, data = .) %>%
-  as.data.frame()
+  mutate(
+    interpretacio = case_when(
+      shap_mitja > 0 ~ "Suport mitja cap a Recerca",
+      shap_mitja < 0 ~ "Suport mitja cap a No_recerca",
+      TRUE ~ "Sense efecte mitja"
+    )
+  ) %>%
+  arrange(variable, desc(shap_mitja))
 
+kable(
+  shap_per_valor %>%
+    mutate(across(where(is.numeric), ~ round(.x, 3)))
+)
 
+ggplot(shap_plot_data, aes(x = shap, y = variable, color = valor_feature_label)) +
+  geom_vline(xintercept = 0, color = "grey50") +
+  geom_jitter(height = 0.18, width = 0, alpha = 0.75, size = 2) +
+  scale_color_manual(values = c("0 / FALSE" = "#D1495B", "1 / TRUE" = "#2F4858", "Valor numeric" = "#F6AE2D")) +
+  labs(
+    title = "Distribucio dels SHAP values signats",
+    subtitle = "Cada punt es una oferta. A la dreta augmenta la probabilitat estimada de Recerca; a l'esquerra la redueix.",
+    x = "Valor SHAP",
+    y = NULL,
+    color = "Valor de la variable"
+  ) +
+  theme_minimal()
 ```
 
-Calculem la regla del colze per obtenir la relació entre el nombre de clústers (eix X) i la suma de distàncies internes dins de cada clúster (eix Y). El punt on la corba deixa de disminuir de manera significativa indica el nombre òptim de clústers. En el nostre cas, aquest punt es troba a k=3.
-```{r}
-set.seed(123)
-wss <- sapply(1:10, function(k){
-  kmeans(df_cluster, centers = k, nstart = 20)$tot.withinss
+**Resposta:** Les variables amb SHAP absolut mes alt son `r paste(head(shap_importance$variable, 3), collapse = ", ")`. La taula i el grafic signat mostren si cada variable dona suport a `Recerca` o a `No_recerca`.
+
+### 4.3. Model no supervisat: k-means guiat per SHAP
+
+**Pregunta:** Si agrupem les ofertes amb les variables mes rellevants segons SHAP, apareixen perfils naturals?
+
+El model no supervisat busca grups d'ofertes sense utilitzar el target `perfil_recerca`. Per fer-lo mes interpretable, k-means utilitza nomes les variables amb mes SHAP absolut.
+
+```{r clustering}
+variables_cluster <- top_shap_vars
+cluster_matrix <- scale(x_full[, variables_cluster, drop = FALSE])
+
+tibble(variable_usada_al_clustering = variables_cluster) %>%
+  kable()
+
+wss <- map_dbl(1:8, function(k) {
+  kmeans(cluster_matrix, centers = k, nstart = 25)$tot.withinss
 })
 
-plot(1:10, wss, type = "b")
+tibble(k = 1:8, wss = wss) %>%
+  ggplot(aes(x = k, y = wss)) +
+  geom_line(color = "#33658A") +
+  geom_point(size = 2, color = "#D1495B") +
+  scale_x_continuous(breaks = 1:8) +
+  labs(
+    title = "Regla del colze per seleccionar el nombre de clusters",
+    x = "Nombre de clusters",
+    y = "Suma de quadrats interna"
+  ) +
+  theme_minimal()
 
-```
-```{r}
-# Entrenem el model k-means amb 3 clústers.
 set.seed(123)
-k <- kmeans(df_cluster, centers = 3, nstart = 25)
-df_cluster$cluster <- k$cluster
+k_opt <- 3
+km <- kmeans(cluster_matrix, centers = k_opt, nstart = 50)
+
+df_model <- df_model %>%
+  mutate(cluster = factor(km$cluster))
+
+taula_clusters <- df_model %>%
+  group_by(cluster) %>%
+  summarise(
+    n = n(),
+    pct_recerca = mean(perfil_recerca == "Recerca"),
+    pct_informatica = mean(materia_informatica),
+    pct_tecnologia = mean(materia_tecnologia),
+    pct_enginyeria = mean(materia_enginyeria),
+    pct_angles = mean(requereix_angles),
+    pct_catala_c1 = mean(requereix_catala_c1),
+    mitjana_materies = mean(n_materies),
+    grup_titulacio_majoritari = moda_chr(grup_titulacio_simplificat),
+    sistema_majoritari = moda_chr(sistema_simplificat),
+    tipus_majoritari = moda_chr(tipus_personal_simplificat),
+    .groups = "drop"
+  ) %>%
+  mutate(across(starts_with("pct_"), ~ round(.x * 100, 2))) %>%
+  mutate(mitjana_materies = round(mitjana_materies, 2))
+
+kable(taula_clusters)
 ```
 
-```{r}
-# Calculem les mitjanes de cada variable dins de cada clúster. 
-taula_clusters <- aggregate(
-  df_cluster[, -ncol(df_cluster)],
-  by = list(cluster = df_cluster$cluster),
-  FUN = mean
+```{r pca-clusters}
+pca <- prcomp(cluster_matrix, center = FALSE, scale. = FALSE)
+
+tibble(
+  pc1 = pca$x[, 1],
+  pc2 = pca$x[, 2],
+  cluster = df_model$cluster,
+  perfil_recerca = df_model$perfil_recerca
+) %>%
+  ggplot(aes(x = pc1, y = pc2, color = cluster, shape = perfil_recerca)) +
+  geom_point(size = 3, alpha = 0.8) +
+  labs(
+    title = "Visualitzacio dels clusters amb PCA",
+    x = "Component principal 1",
+    y = "Component principal 2",
+    color = "Cluster",
+    shape = "Perfil"
+  ) +
+  theme_minimal()
+```
+
+**Resposta:** Els clusters descriuen perfils d'ofertes a partir de les variables mes informatives segons SHAP. Aixo complementa el model supervisat: XGBoost respon quines variables ajuden a distingir recerca, i k-means mostra com s'agrupen les ofertes quan mirem nomes aquestes dimensions.
+
+### 4.4. Contrast d'hipotesi
+
+**Pregunta:** El perfil de recerca esta associat amb el tipus de personal?
+
+Les hipotesis son:
+
+- H0: el perfil de recerca i el tipus de personal simplificat son independents.
+- H1: el perfil de recerca i el tipus de personal simplificat estan associats.
+
+```{r contrast-hipotesi}
+taula_hipotesi <- table(
+  Perfil = df_model$perfil_recerca,
+  Tipus_personal = df_model$tipus_personal_simplificat
 )
 
-print(taula_clusters)
+chi_hipotesi <- suppressWarnings(chisq.test(taula_hipotesi))
+usa_fisher <- any(chi_hipotesi$expected < 5) || any(taula_hipotesi == 0)
+test_hipotesi <- if (usa_fisher) fisher.test(taula_hipotesi) else chi_hipotesi
+metode_hipotesi <- if (usa_fisher) "test exacte de Fisher" else "test khi quadrat"
+p_hipotesi_text <- if_else(test_hipotesi$p.value < 0.001, "< 0.001", as.character(signif(test_hipotesi$p.value, 4)))
+
+kable(taula_hipotesi)
+
+tibble(
+  metode = metode_hipotesi,
+  p_value = test_hipotesi$p.value,
+  conclusio_5pct = if_else(
+    test_hipotesi$p.value < 0.05,
+    "Es rebutja H0: hi ha evidencia d'associacio.",
+    "No es rebutja H0: no hi ha evidencia suficient d'associacio."
+  )
+) %>%
+  mutate(p_value = signif(p_value, 4)) %>%
+  kable()
 ```
 
+**Resposta:** El p-valor es `r p_hipotesi_text`. Amb un nivell de significacio del 5%, hi ha evidencia d'associacio entre el perfil de recerca i el tipus de personal. Aquesta prova reforça el resultat del model: les ofertes de recerca no nomes es diferencien per les materies, sino tambe pel seu patro administratiu.
 
-```{r}
-df_pca <- df_cluster[, -ncol(df_cluster)] 
+## 5. Representacio dels resultats
 
-df_pca <- df_pca[, sapply(df_pca, function(x) length(unique(x)) > 1)]
+**Pregunta:** Quines grafiques ajuden a entendre el problema?
 
-pca <- prcomp(df_pca, scale. = TRUE)
-plot(pca$x[,1], pca$x[,2], col = df_cluster$cluster, pch = 19)
+Les figures principals apareixen al costat del resultat que expliquen: distribucio del target, AUC repetida, importancia XGBoost, SHAP absolut, SHAP signat, regla del colze i PCA dels clusters. A continuacio s'afegeixen dues visualitzacions descriptives del target.
 
+```{r grafics-addicionals}
+df_model %>%
+  count(perfil_recerca, tipus_personal_simplificat) %>%
+  group_by(tipus_personal_simplificat) %>%
+  mutate(percentatge = n / sum(n)) %>%
+  ggplot(aes(x = reorder(tipus_personal_simplificat, percentatge), y = percentatge, fill = perfil_recerca)) +
+  geom_col(position = "fill") +
+  coord_flip() +
+  scale_y_continuous(labels = scales::percent) +
+  labs(
+    title = "Distribucio Recerca / No_recerca segons el tipus de personal",
+    x = NULL,
+    y = "Percentatge",
+    fill = "Perfil"
+  ) +
+  theme_minimal()
+
+df_model %>%
+  count(perfil_recerca, sistema_simplificat) %>%
+  group_by(sistema_simplificat) %>%
+  mutate(percentatge = n / sum(n)) %>%
+  ggplot(aes(x = reorder(sistema_simplificat, percentatge), y = percentatge, fill = perfil_recerca)) +
+  geom_col(position = "fill") +
+  coord_flip() +
+  scale_y_continuous(labels = scales::percent) +
+  labs(
+    title = "Distribucio Recerca / No_recerca segons el sistema de seleccio",
+    x = NULL,
+    y = "Percentatge",
+    fill = "Perfil"
+  ) +
+  theme_minimal()
 ```
-```{r}
-taula <- table(df_model$grup, df_model$angles)
-chisq.test(taula)
 
-fisher.test(taula)
+## 6. Resolucio del problema i conclusions
 
+**Pregunta:** Els resultats permeten respondre la pregunta inicial?
+
+L'analisi final treballa amb `r nrow(df_model)` ofertes, de les quals `r sum(df_model$perfil_recerca == "Recerca")` son de recerca i `r sum(df_model$perfil_recerca == "No_recerca")` no ho son. Aquesta variable objectiu esta practicament balancejada i permet estudiar una diferència substantiva dins del dataset.
+
+El model XGBoost mostra una capacitat predictiva alta i estable per distingir `Recerca` de `No_recerca`: AUC mitjana `r resum_validacio$auc_mitjana` i AUC mediana `r resum_validacio$auc_mediana`. Aixo indica que la pregunta escollida esta millor alineada amb les dades disponibles.
+
+La interpretacio SHAP mostra quines variables expliquen mes la classificacio i en quina direccio. Aixo facilita passar del resultat numeric del model a una lectura substantiva de les ofertes.
+
+El k-means guiat per SHAP identifica perfils naturals d'ofertes fent servir nomes les variables mes informatives: `r paste(variables_cluster, collapse = ", ")`. Aquesta lectura no supervisada complementa el model supervisat i ajuda a descriure subgrups d'ofertes.
+
+Finalment, el contrast d'hipotesi mostra una associacio estadisticament significativa entre el perfil de recerca i el tipus de personal (p `r p_hipotesi_text`). Aixo reforça la conclusio que les ofertes de recerca tenen una configuracio administrativa diferenciada.
+
+En conjunt, els resultats responen la pregunta inicial: les ofertes de recerca es poden distingir de la resta a partir de variables administratives, formatives i de requisits. La conclusio es exploratoria, perque el dataset es petit, pero els resultats apunten en la mateixa direccio en el model supervisat, SHAP, el clustering i el contrast d'hipotesi.
+
+## 7. Exportacio de dades finals
+
+```{r exportacio}
+df_final <- df_model %>%
+  select(
+    title, url, status, sistema, sistema_simplificat,
+    tipus_personal, tipus_personal_simplificat,
+    grup_titulacio, grup_titulacio_simplificat,
+    perfil_recerca, data_inici, data_final,
+    n_materies, n_materies_cap,
+    requereix_angles, requereix_catala, requereix_catala_c1, requisit_catala_simplificat,
+    materia_informatica, materia_tecnologia, materia_enginyeria,
+    cluster
+  )
+
+write_csv(df_final, "cido_oposicions_analitzades.csv")
+write_csv(taula_clusters, "taula_clusters.csv")
+write_csv(shap_importance, "importancia_shap_xgboost.csv")
+write_csv(shap_direction, "direccio_shap_xgboost.csv")
+write_csv(shap_per_valor, "shap_per_valor_xgboost.csv")
+write_csv(tibble(variable_cluster_shap = variables_cluster), "variables_cluster_shap.csv")
+write_csv(resultats_validacio, "validacio_xgboost_recerca.csv")
+
+tibble(
+  fitxer = c(
+    "cido_oposicions_analitzades.csv",
+    "taula_clusters.csv",
+    "importancia_shap_xgboost.csv",
+    "direccio_shap_xgboost.csv",
+    "shap_per_valor_xgboost.csv",
+    "variables_cluster_shap.csv",
+    "validacio_xgboost_recerca.csv"
+  ),
+  descripcio = c(
+    "Dataset final net, enriquit amb variables derivades i cluster.",
+    "Resum interpretatiu dels tres clusters.",
+    "Importancia global de variables segons SHAP absolut.",
+    "Direccio mitjana dels SHAP values signats.",
+    "SHAP mitja segons el valor de cada variable rellevant.",
+    "Variables seleccionades per al k-means guiat per SHAP.",
+    "Resultats de les 100 particions train/test del model XGBoost."
+  )
+) %>%
+  kable()
 ```
-

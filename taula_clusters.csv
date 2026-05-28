@@ -1,4 +1,4 @@
-"cluster","sistemaConcurs o valoració de mèrits","sistemaConcurs oposició o valoració de mèrits i prova","sistemaOposició o prova","tipusFuncionari interí","tipusInterí o temporal","tipusLaboral","tipusLaboral temporal","angles","catala","informatica"
-1,0.947368421052632,0,0.0526315789473684,0,0.105263157894737,0,0.894736842105263,0,0.736842105263158,0.684210526315789
-2,0,0.947368421052632,0.0526315789473684,0,0.157894736842105,0.263157894736842,0,0.0526315789473684,0.894736842105263,0.842105263157895
-3,1,0,0,0,0,0.125,0.875,1,0.025,0.75
+cluster,n,pct_recerca,pct_informatica,pct_tecnologia,pct_enginyeria,pct_angles,pct_catala_c1,mitjana_materies,grup_titulacio_majoritari,sistema_majoritari,tipus_majoritari
+1,41,58.54,75.61,12.2,36.59,0,0,3.24,universitari_a1,merits,laboral_temporal
+2,33,12.12,84.85,21.21,36.36,3.03,96.97,2.67,universitari_a1,prova_o_oposicio,funcionari_o_interi
+3,40,77.5,75,17.5,37.5,100,0,3.67,universitari_a1,merits,laboral_temporal

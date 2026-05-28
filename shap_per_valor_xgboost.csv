@@ -1,0 +1,10 @@
+variable,valor_feature_label,n,shap_mitja,shap_media,interpretacio
+requisit_catala_simplificatno_especificat,1 / TRUE,64,0.19617536780424416,0.1929331123828888,Suport mitja cap a Recerca
+requisit_catala_simplificatno_especificat,0 / FALSE,50,-0.2630314546823502,-0.2547110915184021,Suport mitja cap a No_recerca
+requisit_catala_simplificatcatala_c1,0 / FALSE,82,0.219664089654277,0.24562187492847443,Suport mitja cap a Recerca
+requisit_catala_simplificatcatala_c1,1 / TRUE,32,-0.5933493534103036,-0.5571404695510864,Suport mitja cap a No_recerca
+requereix_anglesTRUE,1 / TRUE,41,0.4635626521052384,0.4670167863368988,Suport mitja cap a Recerca
+requereix_anglesTRUE,0 / FALSE,73,-0.24770607789085336,-0.24356739223003387,Suport mitja cap a No_recerca
+n_materies_cap,Valor numeric,114,0.05475264931457089,-0.2147994339466095,Suport mitja cap a Recerca
+tipus_personal_simplificatlaboral_temporal,1 / TRUE,78,0.7160779650394733,0.7284995913505554,Suport mitja cap a Recerca
+tipus_personal_simplificatlaboral_temporal,0 / FALSE,36,-1.5409438676304288,-1.574499487876892,Suport mitja cap a No_recerca

@@ -1,0 +1,16 @@
+variable,mean_shap,median_shap,pct_positive,mean_abs_shap,direccio_mitjana
+tipus_personal_simplificatlaboral_temporal,0.0033342284068726344,0.648580402135849,68.42105263157895,0.9765619342787225,Empeny cap a Recerca
+n_materies_cap,0.05475264931457089,-0.2147994339466095,41.228070175438596,0.8142035787827091,Empeny cap a Recerca
+requereix_anglesTRUE,0.008101096932302395,-0.22815433144569397,35.96491228070175,0.32533870545918486,Empeny cap a Recerca
+requisit_catala_simplificatcatala_c1,-0.008550210153324547,0.19759760797023773,71.9298245614035,0.3245581987787757,Empeny cap a No_recerca
+requisit_catala_simplificatno_especificat,-0.005231133286367335,0.1688830405473709,56.14035087719298,0.22549821292622046,Empeny cap a No_recerca
+materia_informaticaTRUE,0.006084402173496122,0.055308058857917786,78.0701754385965,0.08949452824890614,Empeny cap a Recerca
+materia_enginyeriaTRUE,-0.00784580383384437,0.044634319841861725,63.1578947368421,0.07354627719573807,Empeny cap a No_recerca
+grup_titulacio_simplificatuniversitari_a1,2.1254774509813777e-5,0.004236916080117226,57.01754385964912,0.022152862070422424,Empeny cap a Recerca
+grup_titulacio_simplificatuniversitari_altres,0.0017448074241544582,0.006574996747076511,64.91228070175438,0.017729335337909952,Empeny cap a Recerca
+materia_tecnologiaTRUE,0.0012898219079432785,0.008702590130269527,83.33333333333334,0.013987853428708357,Empeny cap a Recerca
+tipus_personal_simplificatlaboral_no_temporal,-0.003104711457956253,-0.004059462808072567,14.035087719298245,0.009129103485560208,Empeny cap a No_recerca
+grup_titulacio_simplificatno_universitari,0,0,0,0,Sense direccio mitjana
+sistema_simplificatprova_o_oposicio,0,0,0,0,Sense direccio mitjana
+te_data_finalTRUE,0,0,0,0,Sense direccio mitjana
+mes_final,0,0,0,0,Sense direccio mitjana
